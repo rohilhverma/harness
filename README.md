@@ -1,1 +1,0 @@
-Start of new project, building an Agent Harness allowing for prompting, running of tools, managing of context, subagents, checkpoints. Plan to incorporate features to allow for rewinding and forking for subagents. 
