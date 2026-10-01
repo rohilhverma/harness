@@ -1,17 +1,21 @@
-import { Ollama } from "ollama";
-import OpenAI from "openai";
-import { ProviderRegistry } from "./src/providers/provider-registry";
+import type {
+  Message,
+  ModelConfiguration,
+  ModelProvider,
+  ModelResponse,
+} from "./src/interfaces.js";
 
-class ModelClient {
-    
+export class ModelClient {
+  constructor(
+    private readonly provider: ModelProvider<unknown>,
+    private readonly configuration: ModelConfiguration,
+  ) {}
 
-    constructor() {
-        
-
-
-
-        
-    }
-    
-
+  generate(messages: Message[]): Promise<ModelResponse> {
+    return this.provider.generate({
+      messages,
+      model: this.configuration.model,
+      temperature: this.configuration.temperature,
+    });
+  }
 }

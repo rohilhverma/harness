@@ -1,8 +1,8 @@
 export interface AgentConfiguration {
   identity: AgentIdentity;
   model: ModelConfiguration;
-  tools: ToolConfiguration;
-  memory: MemoryConfiguration;
+  tools: ToolConfiguration[];
+  memory: MemoryConfiguration[];
 }
 
 export interface AgentIdentity {
@@ -17,7 +17,7 @@ export interface ModelConfiguration {
 }
 
 export interface ToolConfiguration {
-  toolDefinitions: ToolDefinition[];
+  toolDefinitions: ToolDefinition;
 }
 
 export interface ModelProvider<Client> {
@@ -49,7 +49,7 @@ export interface ToolDefinition {
 }
 
 export interface MemoryConfiguration {
-  enable: boolean;
+  messages: Message[]
 }
 
 export interface Message {

@@ -1,0 +1,15 @@
+{
+  "extends": "./src/dependencies/tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "./dist",
+    "types": ["node"],
+    "typeRoots": ["./src/dependencies/node_modules/@types"],
+    "paths": {
+      "openai": ["./src/dependencies/node_modules/openai"],
+      "ollama": ["./src/dependencies/node_modules/ollama"]
+    }
+  },
+  "include": ["*.ts", "src/**/*.ts"],
+  "exclude": ["src/dependencies/node_modules", "dist"]
+}
