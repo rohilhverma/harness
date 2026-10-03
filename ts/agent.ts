@@ -2,19 +2,24 @@ import { ModelClient } from "./modelClient.js";
 import type {
   AgentConfiguration,
   AgentIdentity,
-  MemoryConfiguration,
+  ConversationMemory,
   ModelConfiguration,
-  ToolConfiguration,
+  ToolDefinition,
+  ToolExecutionContext,
 } from "./src/interfaces.js";
 import { providerRegistry } from "./src/providers/provider-registry.js";
 
+
 export class Agent implements AgentConfiguration {
+  
   identity: AgentIdentity;
   model: ModelConfiguration;
-  tools: ToolConfiguration[];
-  memory: MemoryConfiguration[];
+  tools: ToolDefinition[];
+  memory: ConversationMemory;
+  systemPrompt: string|undefined
   private readonly modelClient: ModelClient;
 
+  
   constructor(
     providerName: string,
     addr: string,
@@ -23,26 +28,60 @@ export class Agent implements AgentConfiguration {
     this.identity = configuration.identity;
     this.model = configuration.model;
     this.tools = configuration.tools;
-    this.memory = configuration.memory;
-
+    this.memory = configuration.memory
+    this.systemPrompt = undefined;
     const provider = providerRegistry.get(providerName, addr);
     this.modelClient = new ModelClient(provider, this.model);
   }
 
   async run(userPrompt: string) {
-    const response = await this.modelClient.generate([
-      {
-        role: "system",
-        content: this.identity.systemPrompt,
-      },
-      {
-        role: "user",
-        content: userPrompt,
-      },
-    ]);
+    if (this.memory.messages().length === 0) {
+      this.memory.add({ role: "system", content: this.identity.systemPrompt });
+    }
+    this.memory.add({ role: "user", content: userPrompt });
 
-    console.log(response.output.content);
-    return response;
+    const context: ToolExecutionContext = {
+      turn: 0,
+      readRanges: new Map(),
+    };
+
+    for (let turn = 0; turn < 20; turn++) {
+      context.turn = turn;
+      const response = await this.modelClient.generate(this.memory.messages(), this.tools);
+      this.memory.add(response.output);
+
+      if (!response.output.toolCalls?.length) {
+        console.log(response.output.content);
+        return response;
+      }
+
+      for (const call of response.output.toolCalls) {
+        console.log(`[turn ${turn + 1}] ${call.name} arguments:`, call.arguments);
+        let result: unknown;
+        try {
+          const tool = this.tools.find((tool) => tool.name === call.name);
+          if (!tool) throw new Error(`Unknown tool: ${call.name}`);
+
+          const args: unknown = JSON.parse(call.arguments);
+          if (args === null || typeof args !== "object" || Array.isArray(args)) {
+            throw new Error("Tool arguments must be a JSON object.");
+          }
+          if (call.name === "run_command") context.readRanges.clear();
+          result = await tool.execute(args as Record<string, unknown>, context);
+        } catch (error) {
+          result = { ok: false, error: error instanceof Error ? error.message : String(error) };
+        }
+
+        console.log(`[turn ${turn + 1}] ${call.name}`, result);
+        this.memory.add({
+          role: "tool",
+          toolCallId: call.id,
+          content: JSON.stringify(result) ?? "null",
+        });
+      }
+    }
+
+    throw new Error("The demo requires a final answer within six model calls.");
   }
   
 

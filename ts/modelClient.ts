@@ -3,6 +3,7 @@ import type {
   ModelConfiguration,
   ModelProvider,
   ModelResponse,
+  ToolDefinition,
 } from "./src/interfaces.js";
 
 export class ModelClient {
@@ -11,11 +12,12 @@ export class ModelClient {
     private readonly configuration: ModelConfiguration,
   ) {}
 
-  generate(messages: Message[]): Promise<ModelResponse> {
+  generate(messages: Message[], tools: ToolDefinition[] = []): Promise<ModelResponse> {
     return this.provider.generate({
-      messages,
+      messages, 
       model: this.configuration.model,
       temperature: this.configuration.temperature,
-    });
+      tools: tools.length ? tools : undefined,
+      });
   }
 }
