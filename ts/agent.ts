@@ -4,6 +4,7 @@ import type {
   AgentIdentity,
   ConversationMemory,
   ModelConfiguration,
+  ModelResponse,
   ToolDefinition,
   ToolExecutionContext,
 } from "./src/interfaces.js";
@@ -47,15 +48,38 @@ export class Agent implements AgentConfiguration {
 
     for (let turn = 0; turn < 20; turn++) {
       context.turn = turn;
-      const response = await this.modelClient.generate(this.memory.messages(), this.tools);
+      let response: ModelResponse;
+      try {
+        response = await this.modelClient.generate(this.memory.messages(), this.tools);
+      } catch (error) {
+        const failure = new Error("Model provider failed to generate a response.", { cause: error });
+        failure.name = "ModelProviderError";
+        throw failure;
+      }
       this.memory.add(response.output);
 
-      if (!response.output.toolCalls?.length) {
-        console.log(response.output.content);
-        return response;
+      const calls = response.output.toolCalls;
+      switch (response.conclusion) {
+        case "success":
+          if (calls?.length) {
+            throw new Error("Model returned success with tool calls.");
+          }
+          console.log(response.output.content);
+          return response;
+        case "length":
+          console.log("Generation interrupted: output length limit reached.");
+          return response;
+        case "error":
+          console.log("Model returned an error outcome.");
+          return response;
+        case "tool_request":
+          if (!calls?.length) {
+            throw new Error("Model requested tools without providing tool calls.");
+          }
+          break;
       }
 
-      for (const call of response.output.toolCalls) {
+      for (const call of calls) {
         console.log(`[turn ${turn + 1}] ${call.name} arguments:`, call.arguments);
         let result: unknown;
         try {

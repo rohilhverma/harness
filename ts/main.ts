@@ -32,7 +32,9 @@ async function main() {
   });
 
   const response = await agent.run(
-    ``,
+    `
+    I have some notes on huskies, can you go through and replace that document with a paragraph about poodles? You should find it under my notes directory
+    `
   );
   console.log("Conclusion:", response.conclusion);
 }
