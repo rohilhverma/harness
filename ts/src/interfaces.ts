@@ -14,6 +14,8 @@ export interface ModelConfiguration {
   model: string;
   temperature?: number;
   contextWindow?: number;
+  maxTokens?: number;
+  seed?: number;
 }
 
 export interface ToolConfiguration {
@@ -24,6 +26,7 @@ export interface ModelProvider<Client> {
   createClient(): Promise<Client | null>;
   serverStatus(): Promise<boolean>;
   generate(request: ModelRequest): Promise<ModelResponse>;
+  shutdown?(): Promise<void>;
 }
 
 // define a object that handles taking a request and sending to ModelClient
@@ -32,6 +35,8 @@ export interface ModelRequest {
   model?: string;
   temperature?: number;
   tools?: ToolDefinition[];
+  maxTokens?: number;
+  seed?: number;
 }
 
 // have to outline general format of requests
@@ -140,4 +145,15 @@ export interface ToolCalls {
   id: string;
   name: string;
   arguments: string;
+}
+
+export type SidecarReply =
+  | { v: 1; id: string; ok: true; result: Record<string, unknown> }
+  | { v: 1; id: string; ok: false; error: { code: string; message: string } };
+
+export interface SidecarPending {
+  id: string;
+  resolve: (result: Record<string, unknown>) => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
 }

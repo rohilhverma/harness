@@ -17,6 +17,8 @@ export class ModelClient {
       messages, 
       model: this.configuration.model,
       temperature: this.configuration.temperature,
+      maxTokens: this.configuration.maxTokens,
+      seed: this.configuration.seed,
       tools: tools.length ? tools : undefined,
       });
   }

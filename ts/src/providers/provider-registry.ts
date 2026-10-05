@@ -1,5 +1,6 @@
 import type { ModelProvider } from "../interfaces.js";
 import { OpenAIServer } from "./thirdparty.js";
+import { SidecarProvider } from "./sidecar.js";
 
 class ProviderRegistry {
   private readonly providers =
@@ -13,6 +14,9 @@ class ProviderRegistry {
     let provider: ModelProvider<unknown>;
 
     switch (name) {
+      case "sidecar":
+        return new SidecarProvider(address);
+
       case "llama":
         provider = new OpenAIServer(address, apiKey ?? "no-key-required");
         break;
@@ -45,6 +49,9 @@ class ProviderRegistry {
     address: string,
     apiKey?: string,
   ): ModelProvider<unknown> {
+    if (name === "sidecar") {
+      return this.register(name, address, apiKey);
+    }
     const provider = this.providers.get(name)?.get(address);
 
     return provider ?? this.register(name, address, apiKey);

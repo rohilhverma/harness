@@ -66,6 +66,8 @@ export class OpenAIServer implements ModelProvider<OpenAI> {
       model: request.model,
       messages,
       temperature: request.temperature,
+      max_tokens: request.maxTokens,
+      seed: request.seed,
       stream: false,
       parallel_tool_calls: true,
       tools: request.tools?.map((tool) => ({

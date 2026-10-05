@@ -4,6 +4,7 @@ import type {
   AgentIdentity,
   ConversationMemory,
   ModelConfiguration,
+  ModelProvider,
   ModelResponse,
   ToolDefinition,
   ToolExecutionContext,
@@ -25,13 +26,13 @@ export class Agent implements AgentConfiguration {
     providerName: string,
     addr: string,
     configuration: AgentConfiguration,
+    provider: ModelProvider<unknown> = providerRegistry.get(providerName, addr),
   ) {
     this.identity = configuration.identity;
     this.model = configuration.model;
     this.tools = configuration.tools;
     this.memory = configuration.memory
     this.systemPrompt = undefined;
-    const provider = providerRegistry.get(providerName, addr);
     this.modelClient = new ModelClient(provider, this.model);
   }
 
