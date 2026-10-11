@@ -16,8 +16,7 @@ Inference::Inference(llama_model* loaded_model) : model(loaded_model) {
     }
 }
 
-GenerationResult Inference::generate(const std::string& prompt, int max_tokens,
-                                    float temperature, std::uint32_t seed) try {
+PreparationResult Inference::prefill(const std::string& prompt, int additional_positions) {
     const auto* vocab = llama_model_get_vocab(model);
     const int required = llama_tokenize(
         vocab, prompt.data(), static_cast<int>(prompt.size()),
@@ -31,9 +30,9 @@ GenerationResult Inference::generate(const std::string& prompt, int max_tokens,
               << " batch=" << llama_n_batch(context.get())
               << " ubatch=" << llama_n_ubatch(context.get())
               << " prompt_tokens=" << n_prompt << '\n';
-    if (static_cast<std::int64_t>(n_prompt) + max_tokens - 1 >
+    if (static_cast<std::int64_t>(n_prompt) + additional_positions >
         llama_n_ctx_seq(context.get())) {
-        throw std::invalid_argument("Prompt and max_tokens exceed context capacity.");
+        throw std::invalid_argument("Prompt and output allowance exceed context capacity.");
     }
 
     std::vector<llama_token> prompt_tokens(n_prompt);
@@ -58,16 +57,6 @@ GenerationResult Inference::generate(const std::string& prompt, int max_tokens,
               << " prefill=" << n_prompt - reused << '\n';
     evaluated.resize(reused);
 
-    std::unique_ptr<llama_sampler, decltype(&llama_sampler_free)> sampler(
-        llama_sampler_chain_init(llama_sampler_chain_default_params()),
-        llama_sampler_free);
-    if (temperature == 0) {
-        llama_sampler_chain_add(sampler.get(), llama_sampler_init_greedy());
-    } else {
-        llama_sampler_chain_add(sampler.get(), llama_sampler_init_temp(temperature));
-        llama_sampler_chain_add(sampler.get(), llama_sampler_init_dist(seed));
-    }
-
     const int batch_size = std::min(n_prompt - reused,
         static_cast<int>(llama_n_batch(context.get())));
     std::vector<llama_pos> positions(batch_size);
@@ -77,7 +66,7 @@ GenerationResult Inference::generate(const std::string& prompt, int max_tokens,
     batch.pos = positions.data();
     batch.logits = request_logits.data();
 
-    GenerationResult result;
+    PreparationResult result;
     result.prompt_tokens = n_prompt;
     result.reused_tokens = reused;
     const auto prefill_started = std::chrono::steady_clock::now();
@@ -95,14 +84,48 @@ GenerationResult Inference::generate(const std::string& prompt, int max_tokens,
         evaluated.insert(evaluated.end(), prompt_tokens.begin() + offset,
                          prompt_tokens.begin() + offset + batch.n_tokens);
         result.prefilled_tokens += batch.n_tokens;
-        result.evaluated_tokens += batch.n_tokens;
     }
 
-    const auto generation_started = std::chrono::steady_clock::now();
     std::cerr << "[sidecar] prefill ms="
               << std::chrono::duration_cast<std::chrono::milliseconds>(
-                  generation_started - prefill_started).count() << '\n';
-    llama_pos next_position = n_prompt;
+                  std::chrono::steady_clock::now() - prefill_started).count() << '\n';
+    return result;
+}
+
+PreparationResult Inference::prepare(const std::string& prompt) try {
+    return prefill(prompt, 0);
+} catch (...) {
+    std::cerr << "[sidecar] preparation failed; clearing cached state\n";
+    llama_memory_clear(llama_get_memory(context.get()), true);
+    evaluated.clear();
+    throw;
+}
+
+GenerationResult Inference::generate(const std::string& prompt, int max_tokens,
+                                    float temperature, std::uint32_t seed) try {
+    const auto prepared = prefill(prompt, max_tokens - 1);
+    GenerationResult result;
+    result.prompt_tokens = prepared.prompt_tokens;
+    result.reused_tokens = prepared.reused_tokens;
+    result.prefilled_tokens = prepared.prefilled_tokens;
+    result.evaluated_tokens = prepared.prefilled_tokens;
+    const auto* vocab = llama_model_get_vocab(model);
+    std::unique_ptr<llama_sampler, decltype(&llama_sampler_free)> sampler(
+        llama_sampler_chain_init(llama_sampler_chain_default_params()),
+        llama_sampler_free);
+    if (temperature == 0) {
+        llama_sampler_chain_add(sampler.get(), llama_sampler_init_greedy());
+    } else {
+        llama_sampler_chain_add(sampler.get(), llama_sampler_init_temp(temperature));
+        llama_sampler_chain_add(sampler.get(), llama_sampler_init_dist(seed));
+    }
+
+    llama_pos position = prepared.prompt_tokens;
+    std::int8_t request_logits = 1;
+    llama_batch batch{};
+    batch.pos = &position;
+    batch.logits = &request_logits;
+    const auto generation_started = std::chrono::steady_clock::now();
     std::string piece(128, '\0');
     while (result.generated_tokens < max_tokens) {
         llama_token token = llama_sampler_sample(sampler.get(), context.get(), -1);
@@ -127,14 +150,13 @@ GenerationResult Inference::generate(const std::string& prompt, int max_tokens,
 
         batch.n_tokens = 1;
         batch.token = &token;
-        positions[0] = next_position;
-        request_logits[0] = 1;
+
         const int status = llama_decode(context.get(), batch);
         if (status != 0) {
-            throw std::runtime_error("Decode failed at position " + std::to_string(next_position) + ": " + std::to_string(status));
+            throw std::runtime_error("Decode failed at position " + std::to_string(position) + ": " + std::to_string(status));
         }
         evaluated.push_back(token);
-        ++next_position;
+        ++position;
         ++result.evaluated_tokens;
     }
     std::cerr << "[sidecar] generation ms="

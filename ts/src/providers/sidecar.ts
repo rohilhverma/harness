@@ -5,11 +5,18 @@ import type {
 } from "../interfaces.js";
 import { parseQwen, renderQwen } from "./qwen.js";
 
+interface PreparationResult {
+  prompt_tokens: number;
+  reused_tokens: number;
+  prefilled_tokens: number;
+}
+
 export class SidecarProvider implements ModelProvider<ChildProcessWithoutNullStreams> {
   private child?: ChildProcessWithoutNullStreams;
   private ready?: Promise<ChildProcessWithoutNullStreams>;
   private closed?: Promise<void>;
   private pending?: SidecarPending;
+  private preparation?: Promise<PreparationResult>;
   private failure?: Error;
   private nextId = 0;
   private stderrTail = "";
@@ -128,7 +135,28 @@ export class SidecarProvider implements ModelProvider<ChildProcessWithoutNullStr
     }
   }
 
+  prepare(request: Pick<ModelRequest, "messages" | "tools">): Promise<PreparationResult> {
+    if (this.preparation) return Promise.reject(new Error("Preparation has already been started."));
+    // The executor snapshots synchronously and captures rendering errors as rejections.
+    const rendered = new Promise<string>((resolvePrompt) => resolvePrompt(renderQwen(request)));
+    this.preparation = rendered.then(async (prompt) => {
+      await this.createClient();
+      const result = await this.send("prepare", { prompt });
+      const { prompt_tokens, reused_tokens, prefilled_tokens } = result;
+      if (Object.keys(result).length !== 3 ||
+          ![prompt_tokens, reused_tokens, prefilled_tokens].every(Number.isInteger) ||
+          Number(prompt_tokens) <= 0 || Number(reused_tokens) < 0 || Number(prefilled_tokens) <= 0 ||
+          Number(reused_tokens) + Number(prefilled_tokens) !== prompt_tokens) {
+        throw this.fail(new Error("Invalid sidecar preparation result."));
+      }
+      return { prompt_tokens: Number(prompt_tokens), reused_tokens: Number(reused_tokens),
+        prefilled_tokens: Number(prefilled_tokens) };
+    });
+    return this.preparation;
+  }
+
   async generate(request: ModelRequest): Promise<ModelResponse> {
+    await this.preparation;
     await this.createClient();
     const result = await this.send("generate", {
       prompt: renderQwen(request),
@@ -152,7 +180,10 @@ export class SidecarProvider implements ModelProvider<ChildProcessWithoutNullStr
 
   async shutdown(): Promise<void> {
     this.failure ??= new Error("Sidecar has been shut down.");
-    if (!this.child) return;
+    if (!this.child) {
+      await this.preparation?.catch(() => {});
+      return;
+    }
     if (this.pending) {
       clearTimeout(this.pending.timer);
       this.pending.reject(this.failure);
@@ -162,5 +193,6 @@ export class SidecarProvider implements ModelProvider<ChildProcessWithoutNullStr
     const timer = setTimeout(() => this.child?.kill("SIGKILL"), 5000);
     await this.closed;
     clearTimeout(timer);
+    await this.preparation?.catch(() => {});
   }
 }

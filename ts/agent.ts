@@ -9,7 +9,6 @@ import type {
   ToolDefinition,
   ToolExecutionContext,
 } from "./src/interfaces.js";
-import { providerRegistry } from "./src/providers/provider-registry.js";
 
 
 export class Agent implements AgentConfiguration {
@@ -18,21 +17,17 @@ export class Agent implements AgentConfiguration {
   model: ModelConfiguration;
   tools: ToolDefinition[];
   memory: ConversationMemory;
-  systemPrompt: string|undefined
   private readonly modelClient: ModelClient;
 
   
   constructor(
-    providerName: string,
-    addr: string,
     configuration: AgentConfiguration,
-    provider: ModelProvider<unknown> = providerRegistry.get(providerName, addr),
+    provider: ModelProvider<unknown>,
   ) {
     this.identity = configuration.identity;
     this.model = configuration.model;
     this.tools = configuration.tools;
     this.memory = configuration.memory
-    this.systemPrompt = undefined;
     this.modelClient = new ModelClient(provider, this.model);
   }
 

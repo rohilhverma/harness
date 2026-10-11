@@ -44,6 +44,36 @@ Json handle_record(const std::string& line, Inference* inference) {
     } else if (request["method"] == "ping") {
         response["ok"] = true;
         response["result"] = {{"status", "ready"}};
+    } else if (request["method"] == "prepare") {
+        const auto& params = request["params"];
+        if (params.size() != 1 || !params.contains("prompt") ||
+            !params["prompt"].is_string() || params["prompt"] == "") {
+            response["error"] = {
+                {"code", "invalid_request"}, {"message", "Expected only a nonempty prompt."}
+            };
+        } else if (!inference) {
+            response["error"] = {
+                {"code", "model_not_loaded"}, {"message", "No model is loaded."}
+            };
+        } else {
+            try {
+                const auto result = inference->prepare(params["prompt"].get<std::string>());
+                response["result"] = {
+                    {"prompt_tokens", result.prompt_tokens},
+                    {"reused_tokens", result.reused_tokens},
+                    {"prefilled_tokens", result.prefilled_tokens}
+                };
+                response["ok"] = true;
+            } catch (const std::invalid_argument& error) {
+                response["error"] = {
+                    {"code", "invalid_request"}, {"message", error.what()}
+                };
+            } catch (const std::exception& error) {
+                response["error"] = {
+                    {"code", "internal_error"}, {"message", error.what()}
+                };
+            }
+        }
     } else if (request["method"] != "generate") {
         response["error"] = {
             {"code", "unknown_method"}, {"message", "Unknown method."}

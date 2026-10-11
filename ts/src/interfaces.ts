@@ -11,15 +11,9 @@ export interface AgentIdentity {
 }
 
 export interface ModelConfiguration {
-  model: string;
   temperature?: number;
-  contextWindow?: number;
   maxTokens?: number;
   seed?: number;
-}
-
-export interface ToolConfiguration {
-  toolDefinitions: ToolDefinition;
 }
 
 export interface ModelProvider<Client> {
@@ -32,7 +26,6 @@ export interface ModelProvider<Client> {
 // define a object that handles taking a request and sending to ModelClient
 export interface ModelRequest {
   messages: Message[];
-  model?: string;
   temperature?: number;
   tools?: ToolDefinition[];
   maxTokens?: number;
@@ -71,12 +64,6 @@ export interface RunCommandResult {
   stderr: string;
   output_truncated: boolean;
   error: string | null;
-}
-
-export interface ReadFileArgs {
-  path: string;
-  start_line?: number;
-  line_count?: number;
 }
 
 export type ReadFileResult =

@@ -15,7 +15,6 @@ export class ModelClient {
   generate(messages: Message[], tools: ToolDefinition[] = []): Promise<ModelResponse> {
     return this.provider.generate({
       messages, 
-      model: this.configuration.model,
       temperature: this.configuration.temperature,
       maxTokens: this.configuration.maxTokens,
       seed: this.configuration.seed,

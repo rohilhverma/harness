@@ -21,7 +21,6 @@ const NPM_SCRIPTS = new Set([
 ]);
 const UNSAFE_FLAGS =
   /^(?:--(?:cwd|directory|prefix|git-dir|work-tree|exec-path|config|config-env|script-shell|userconfig|globalconfig|registry|global|pre|hostname-bin|ext-diff|textconv)(?:=|$)|-C|-exec(?:=|$)|-toolexec(?:=|$))/;
-const SHELL_OPERATORS = new Set(["|", "||", "&&", ";", "&", ">", ">>", "<"]);
 
 function insideWorkspace(root: string, path: string): boolean {
   const pathFromRoot = relative(root, path);
@@ -123,7 +122,7 @@ export function createRunCommandTool(workspaceRoot: string): ToolDefinition {
       type: "object",
       properties: {
         command: { type: "string", enum: Object.keys(COMMANDS), description: "Executable name only." },
-        args: { type: "array", items: { type: "string" }, default: [], description: "Separate arguments; no shell operators. rg supports common search flags, -e/-f/-g, -A/-B/-C/-m, their long forms, and --; unsupported flags are rejected." },
+        args: { type: "array", items: { type: "string" }, default: [], description: "Separate arguments; no shell. rg supports common search flags, -e/-f/-g, -A/-B/-C/-m, their long forms, and --; unsupported flags are rejected." },
         cwd: { type: "string", minLength: 1, default: ".", description: "Workspace-relative working directory." },
       },
       required: ["command"],
@@ -145,11 +144,10 @@ export function createRunCommandTool(workspaceRoot: string): ToolDefinition {
       if (command === "npm" && args[0] === "run" && !NPM_SCRIPTS.has(args[1] ?? "")) {
         return failure("Only test/build/lint/format/check/typecheck/validate scripts are allowed.");
       }
-      if (args.some((arg) => SHELL_OPERATORS.has(arg) ||
-        (command !== "rg" && UNSAFE_FLAGS.test(arg))) ||
+      if (args.some((arg) => command !== "rg" && UNSAFE_FLAGS.test(arg)) ||
         (command === "npm" && args.some((arg) => /^(?:-g|-w|--workspaces?(?:=|$))/.test(arg))) ||
         (command === "git" && args.some((arg) => /^(?:--output(?:=|$)|-o|-c|-O)/.test(arg)))) {
-        return failure("Shell operators and directory/configuration/execution overrides are not allowed.");
+        return failure("Directory/configuration/execution overrides are not allowed.");
       }
 
       try {
