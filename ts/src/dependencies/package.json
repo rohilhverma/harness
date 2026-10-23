@@ -1,0 +1,18 @@
+{
+  "name": "coding-agent-harness",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild ../../main.ts --bundle --platform=node --target=node22 --format=cjs --tsconfig=../../tsconfig.json --outfile=../../dist/main.cjs",
+    "typecheck": "tsc --noEmit --project ../../tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

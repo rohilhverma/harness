@@ -5,6 +5,9 @@ import type {
 } from "../interfaces.js";
 import { parseQwen, renderQwen } from "./qwen.js";
 
+// Matches n_ctx in c/src/model.cpp.
+export const CONTEXT_TOKENS = 16384;
+
 interface PreparationResult {
   prompt_tokens: number;
   reused_tokens: number;
@@ -25,6 +28,7 @@ export class SidecarProvider implements ModelProvider<ChildProcessWithoutNullStr
     private readonly modelPath: string,
     private readonly executable = process.env.SIDECAR_EXECUTABLE ?? resolve("c/build/harness-sidecar"),
     private readonly timeoutMs = 300_000,
+    private diagnostics: (text: string) => void = (text) => { process.stderr.write(text); },
   ) {}
 
   async createClient(): Promise<ChildProcessWithoutNullStreams> {
@@ -49,7 +53,7 @@ export class SidecarProvider implements ModelProvider<ChildProcessWithoutNullStr
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => {
       this.stderrTail = (this.stderrTail + chunk).slice(-8192);
-      process.stderr.write(chunk);
+      this.log(chunk);
     });
     child.stdout.setEncoding("utf8");
     let buffer = "";
@@ -106,11 +110,20 @@ export class SidecarProvider implements ModelProvider<ChildProcessWithoutNullStr
     return new Promise((resolveReply, reject) => {
       const timer = setTimeout(() => this.fail(new Error("Sidecar request " + id + " timed out.")), this.timeoutMs);
       this.pending = { id, resolve: resolveReply, reject, timer };
-      console.error("[sidecar-provider] send id=%s method=%s bytes=%d", id, method, Buffer.byteLength(record));
+      this.log(`[sidecar-provider] send id=${id} method=${method} bytes=${Buffer.byteLength(record)}\n`);
       this.child!.stdin.write(record + "\n", (error) => {
         if (error) this.fail(error);
       });
     });
+  }
+
+  private log(text: string) {
+    try { this.diagnostics(text); }
+    catch (error) {
+      console.error("Model diagnostic output failed; using stderr:", error);
+      this.diagnostics = (message) => { process.stderr.write(message); };
+      this.diagnostics(text);
+    }
   }
 
   private fail(error: Error): Error {
@@ -124,15 +137,6 @@ export class SidecarProvider implements ModelProvider<ChildProcessWithoutNullStr
     }
     this.child?.kill();
     return this.failure;
-  }
-
-  async serverStatus(): Promise<boolean> {
-    try {
-      await this.createClient();
-      return true;
-    } catch {
-      return false;
-    }
   }
 
   prepare(request: Pick<ModelRequest, "messages" | "tools">): Promise<PreparationResult> {
@@ -163,19 +167,35 @@ export class SidecarProvider implements ModelProvider<ChildProcessWithoutNullStr
       max_tokens: request.maxTokens ?? 2048,
       temperature: request.temperature ?? 0.2,
       ...(request.seed === undefined ? {} : { seed: request.seed }),
+      ...(request.sequence === undefined ? {} : { sequence: request.sequence }),
     });
     const { text, completion_reason, prompt_tokens, generated_tokens, evaluated_tokens } = result;
     if (typeof text !== "string" || (completion_reason !== "eog" && completion_reason !== "length") ||
         ![prompt_tokens, generated_tokens, evaluated_tokens].every((value) => Number.isInteger(value) && Number(value) > 0)) {
       throw this.fail(new Error("Invalid sidecar generation result."));
     }
-    console.error("[sidecar-provider] result prompt=%d generated=%d evaluated=%d reason=%s",
-      prompt_tokens, generated_tokens, evaluated_tokens, completion_reason);
+    this.log(`[sidecar-provider] result prompt=${prompt_tokens} generated=${generated_tokens} evaluated=${evaluated_tokens} reason=${completion_reason}\n`);
+    const usage = { promptTokens: Number(prompt_tokens), generatedTokens: Number(generated_tokens) };
     if (completion_reason === "length") {
-      return { output: { role: "assistant", content: text }, conclusion: "length" };
+      return { output: { role: "assistant", content: text }, conclusion: "length", usage };
     }
-    const output = parseQwen(text);
-    return { output, conclusion: output.toolCalls?.length ? "tool_request" : "success" };
+    try {
+      const output = parseQwen(text);
+      return { output, conclusion: output.toolCalls?.length ? "tool_request" : "success", usage };
+    } catch (error) {
+      // The reply itself was valid, so end the turn as an error outcome and keep the raw text.
+      this.log(`[sidecar-provider] unparsable output: ${error instanceof Error ? error.message : String(error)}\n`);
+      return { output: { role: "assistant", content: text }, conclusion: "error", usage };
+    }
+  }
+
+  async release(sequence: number): Promise<void> {
+    await this.createClient();
+    const result = await this.send("release", { sequence });
+    if (Object.keys(result).length !== 1 || !Number.isInteger(result.released_tokens) ||
+        Number(result.released_tokens) < 0) {
+      throw this.fail(new Error("Invalid sidecar release result."));
+    }
   }
 
   async shutdown(): Promise<void> {

@@ -74,6 +74,24 @@ Json handle_record(const std::string& line, Inference* inference) {
                 };
             }
         }
+    } else if (request["method"] == "release") {
+        const auto& params = request["params"];
+        if (params.size() != 1 || !params.contains("sequence") ||
+            !params["sequence"].is_number_integer() ||
+            params["sequence"] < 0 || params["sequence"] > 1) {
+            response["error"] = {
+                {"code", "invalid_request"}, {"message", "Expected only sequence 0 or 1."}
+            };
+        } else if (!inference) {
+            response["error"] = {
+                {"code", "model_not_loaded"}, {"message", "No model is loaded."}
+            };
+        } else {
+            response["result"] = {
+                {"released_tokens", inference->release(params["sequence"].get<int>())}
+            };
+            response["ok"] = true;
+        }
     } else if (request["method"] != "generate") {
         response["error"] = {
             {"code", "unknown_method"}, {"message", "Unknown method."}
@@ -84,7 +102,8 @@ Json handle_record(const std::string& line, Inference* inference) {
         for (const auto& item : params.items()) {
             known_params = known_params &&
                 (item.key() == "prompt" || item.key() == "max_tokens" ||
-                 item.key() == "temperature" || item.key() == "seed");
+                 item.key() == "temperature" || item.key() == "seed" ||
+                 item.key() == "sequence");
         }
         if (!known_params ||
             !params.contains("prompt") || !params["prompt"].is_string() ||
@@ -98,11 +117,15 @@ Json handle_record(const std::string& line, Inference* inference) {
               !std::isfinite(params["temperature"].get<float>()))) ||
             (params.contains("seed") &&
              (!params["seed"].is_number_integer() || params["seed"] < 0 ||
-              params["seed"] >= std::numeric_limits<std::uint32_t>::max()))) {
+              params["seed"] >= std::numeric_limits<std::uint32_t>::max())) ||
+            (params.contains("sequence") &&
+             (!params["sequence"].is_number_integer() ||
+              params["sequence"] < 0 || params["sequence"] > 1))) {
             response["error"] = {
                 {"code", "invalid_request"},
                 {"message", "Expected nonempty prompt, positive 32-bit max_tokens, "
-                            "optional temperature (0..2), and optional seed (0..4294967294)."}
+                            "optional temperature (0..2), optional seed (0..4294967294), "
+                            "and optional sequence (0 or 1)."}
             };
         } else if (!inference) {
             response["error"] = {
@@ -114,12 +137,14 @@ Json handle_record(const std::string& line, Inference* inference) {
                           << " max_tokens=" << params["max_tokens"]
                           << " temperature=" << params.value("temperature", 0.2f)
                           << " seed=" << params.value("seed", std::numeric_limits<std::uint32_t>::max())
+                          << " sequence=" << params.value("sequence", 0)
                           << '\n';
                 const auto result = inference->generate(
                     params["prompt"].get<std::string>(),
                     params["max_tokens"].get<int>(),
                     params.value("temperature", 0.2f),
-                    params.value("seed", std::numeric_limits<std::uint32_t>::max()));
+                    params.value("seed", std::numeric_limits<std::uint32_t>::max()),
+                    params.value("sequence", 0));
                 response["result"] = {
                     {"text", result.text},
                     {"completion_reason", result.completion_reason},

@@ -43,10 +43,15 @@ function runProcess(
   command: string,
   args: string[],
   cwd: string,
+  gitCeiling?: string,
 ): Promise<RunCommandResult> {
   return new Promise((resolveResult) => {
+    const env = gitCeiling ? {
+      ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_"))),
+      GIT_CEILING_DIRECTORIES: dirname(gitCeiling), GIT_DISCOVERY_ACROSS_FILESYSTEM: "0", PWD: cwd,
+    } : process.env;
     const child = spawn(command, args, {
-      cwd, shell: false, detached: true, stdio: ["ignore", "pipe", "pipe"],
+      cwd, env, shell: false, detached: true, stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout: Buffer = Buffer.alloc(0);
     let stderr: Buffer = Buffer.alloc(0);
@@ -108,7 +113,7 @@ function runProcess(
   });
 }
 
-export function createRunCommandTool(workspaceRoot: string): ToolDefinition {
+export function createRunCommandTool(workspaceRoot: string, isolateParentGit = false): ToolDefinition {
   const root = realpathSync(workspaceRoot);
 
   return {
@@ -227,7 +232,7 @@ export function createRunCommandTool(workspaceRoot: string): ToolDefinition {
         if (command === "rg") processArgs.unshift("--no-config");
 
         console.log("[run_command] " + command + " (cwd: " + (relative(root, directory) || ".") + ")");
-        return await runProcess(executable, processArgs, directory);
+        return await runProcess(executable, processArgs, directory, isolateParentGit ? root : undefined);
       } catch (error) {
         return failure(error instanceof Error ? error.message : String(error), "failed");
       }

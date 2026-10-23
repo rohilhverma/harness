@@ -1,3 +1,10 @@
 /Agent Harness with a C++ Session Sidecar Plan and Learning Guide.md
 .runtime/
 .env
+.DS_Store
+.vscode/
+build/
+*.log
+/sessions/
+/logs/
+/snapshots.git/

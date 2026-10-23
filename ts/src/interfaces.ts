@@ -18,27 +18,37 @@ export interface ModelConfiguration {
 
 export interface ModelProvider<Client> {
   createClient(): Promise<Client | null>;
-  serverStatus(): Promise<boolean>;
   generate(request: ModelRequest): Promise<ModelResponse>;
+  release?(sequence: number): Promise<void>;
   shutdown?(): Promise<void>;
 }
 
-// define a object that handles taking a request and sending to ModelClient
 export interface ModelRequest {
   messages: Message[];
   temperature?: number;
   tools?: ToolDefinition[];
   maxTokens?: number;
   seed?: number;
+  sequence?: number;
 }
 
-// have to outline general format of requests
 export interface ModelResponse {
   output: Message;
   conclusion: "success" | "error" | "length" | "tool_request";
+  usage: { promptTokens: number; generatedTokens: number }; // Exact sidecar counts for this request.
+}
+
+// Remaining allowances for one outer user task, shared with its children.
+export interface RunBudget {
+  modelCalls: number;
+  toolCalls: number;
+  delegations: number;
 }
 
 export interface ToolExecutionContext {
+  budget: RunBudget;
+  depth: 0 | 1;
+  userTask: string;
   turn: number;
   readRanges: Map<string, {
     version: string;

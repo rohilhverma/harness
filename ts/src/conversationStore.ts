@@ -1,8 +1,9 @@
 import { constants } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, open, readdir, realpath, unlink, type FileHandle } from "node:fs/promises";
+import { link, mkdir, open, readdir, realpath, rename, unlink, writeFile, type FileHandle } from "node:fs/promises";
 import { join } from "node:path";
 import type { Message, ToolDefinition } from "./interfaces.js";
+import { WorkspaceHistory } from "./workspaceHistory.js";
 
 interface Configuration {
   workspace: string;
@@ -12,7 +13,8 @@ interface Configuration {
 }
 
 interface Header {
-  v: 1;
+  v: 1 | 2;
+  baseline?: string;
   kind: "header";
   conversationId: string;
   configuration: Configuration;
@@ -24,6 +26,8 @@ interface Checkpoint {
   ordinal: number;
   id: string;
   messageCount: number;
+  tree?: string;
+  messages?: Message[];
 }
 
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -115,9 +119,12 @@ function parseHistory(bytes: Buffer, conversationId: string) {
   const lines = bytes.subarray(0, completeEnd).toString("utf8").split("\n");
   lines.pop();
   const value: unknown = JSON.parse(lines[0]!);
-  if (!object(value) || !fields(value, ["v", "kind", "conversationId", "configuration", "label", "origin"]) ||
-      value.v !== 1 || value.kind !== "header" || value.conversationId !== conversationId) {
+  if (!object(value) || !fields(value, ["v", "kind", "conversationId", "configuration", "label", "origin", "baseline"]) ||
+      (value.v !== 1 && value.v !== 2) || value.kind !== "header" || value.conversationId !== conversationId) {
     throw new Error("Invalid conversation header.");
+  }
+  if (value.v === 2 ? typeof value.baseline !== "string" || !/^[0-9a-f]{40}$/.test(value.baseline) : value.baseline !== undefined) {
+    throw new Error("Invalid initial file snapshot.");
   }
   validateConfiguration(value.configuration);
   if (value.label !== undefined) {
@@ -131,7 +138,7 @@ function parseHistory(bytes: Buffer, conversationId: string) {
         typeof origin.rootConversationId !== "string" ||
         !uuidPattern.test(origin.conversationId) || !uuidPattern.test(origin.rootConversationId) ||
         !origin.checkpointId.startsWith(origin.conversationId + ":") ||
-        !/^[1-9][0-9]*$/.test(origin.checkpointId.slice(origin.conversationId.length + 1))) {
+        !(value.v === 2 ? /^(?:0|[1-9][0-9]*)$/ : /^[1-9][0-9]*$/).test(origin.checkpointId.slice(origin.conversationId.length + 1))) {
       throw new Error("Invalid conversation origin.");
     }
   }
@@ -140,11 +147,13 @@ function parseHistory(bytes: Buffer, conversationId: string) {
   const hash = createHash("sha256").update(headerBytes);
   const messages: Message[] = [];
   const records: string[] = [];
-  const checkpoints: Checkpoint[] = [];
+  const checkpoints: Checkpoint[] = header.v === 2 ?
+    [{ ordinal: 0, id: conversationId + ":0", messageCount: 0, tree: header.baseline!, messages: [] }] : [];
   let offset = headerBytes.length;
-  let savedEnd = 0;
+  let savedEnd = header.v === 2 ? headerBytes.length : 0;
   let savedCount = 0;
   let savedHash = hash.copy();
+  let headOrdinal = header.v === 2 ? 0 : undefined;
   for (const line of lines.slice(1)) {
     const record: unknown = JSON.parse(line);
     const raw = Buffer.from(line + "\n");
@@ -156,14 +165,35 @@ function parseHistory(bytes: Buffer, conversationId: string) {
       messages.push(record.message);
       records.push(messageRecord(record.message, records.length));
       hash.update(raw);
-    } else if (record.kind === "checkpoint" && fields(record, ["v", "kind", "id", "messageCount", "digest"])) {
+    } else if (record.kind === "checkpoint" && fields(record, ["v", "kind", "id", "messageCount", "digest", "tree"])) {
+      if (header.v === 2 ? typeof record.tree !== "string" || !/^[0-9a-f]{40}$/.test(record.tree) : record.tree !== undefined) {
+        throw new Error("Invalid checkpoint file snapshot.");
+      }
+      const digest = hash.copy();
+      if (header.v === 2) digest.update("\0" + record.tree);
       if (record.messageCount !== messages.length || messages.length <= savedCount ||
-          record.id !== conversationId + ":" + messages.length ||
-          record.digest !== hash.copy().digest("hex")) {
+          record.id !== conversationId + ":" + (header.v === 2 ? checkpoints.length : messages.length) ||
+          record.digest !== digest.digest("hex")) {
         throw new Error("Invalid checkpoint identity, count or history digest.");
       }
-      checkpoints.push({ ordinal: checkpoints.length + 1, id: record.id, messageCount: messages.length });
+      checkpoints.push({ ordinal: checkpoints.length + (header.v === 2 ? 0 : 1), id: record.id,
+        messageCount: messages.length, ...(header.v === 2 ? { tree: record.tree as string, messages: messages.slice() } : {}) });
+      headOrdinal = checkpoints.at(-1)!.ordinal;
       savedCount = messages.length;
+      savedEnd = offset;
+      savedHash = hash.copy();
+    } else if (header.v === 2 && record.kind === "rewind" &&
+        fields(record, ["v", "kind", "checkpointId", "recoveryTree", "operationId", "digest"])) {
+      const target = checkpoints.find((item) => item.id === record.checkpointId);
+      if (!target || typeof record.recoveryTree !== "string" || !/^[0-9a-f]{40}$/.test(record.recoveryTree) ||
+          typeof record.operationId !== "string" || !uuidPattern.test(record.operationId) ||
+          record.digest !== JSON.parse(rewindRecord(hash, target.id, record.recoveryTree, record.operationId)).digest ||
+          messages.length !== savedCount) throw new Error("Invalid saved rewind record.");
+      messages.splice(0, messages.length, ...target.messages!);
+      records.splice(0, records.length, ...messages.map(messageRecord));
+      savedCount = messages.length;
+      headOrdinal = target.ordinal;
+      hash.update(raw);
       savedEnd = offset;
       savedHash = hash.copy();
     } else {
@@ -171,7 +201,12 @@ function parseHistory(bytes: Buffer, conversationId: string) {
     }
   }
   return { header, headerBytes, messages: messages.slice(0, savedCount),
-    records: records.slice(0, savedCount), checkpoints, savedEnd, savedHash };
+    records: records.slice(0, savedCount), checkpoints, headOrdinal, savedEnd, savedHash };
+}
+
+function rewindRecord(hash: ReturnType<typeof createHash>, checkpointId: string, recoveryTree: string, operationId: string): string {
+  return JSON.stringify({ v: 1, kind: "rewind", checkpointId, recoveryTree, operationId,
+    digest: hash.copy().update("\0rewind\0" + checkpointId + "\0" + recoveryTree + "\0" + operationId).digest("hex") }) + "\n";
 }
 
 // One runner owns this store. Await each open/checkpoint/close before the next call;
@@ -188,11 +223,15 @@ export class ConversationStore {
     private readonly log: FileHandle,
     private readonly lock: FileHandle,
     private readonly lockPath: string,
+    private readonly fileHistory?: WorkspaceHistory,
   ) {
     this.hash.update(headerBytes);
   }
 
   get conversationId(): string { return this.header.conversationId; }
+  get workingDirectory(): string { return this.fileHistory?.directory ?? this.header.configuration.workspace; }
+
+  private nextOrdinal = 1;
   get rootConversationId(): string { return this.header.origin?.rootConversationId ?? this.conversationId; }
 
   hasUnsavedMessages(messages: Message[]): boolean {
@@ -201,16 +240,47 @@ export class ConversationStore {
       this.savedRecords.some((record, index) => records[index] !== record);
   }
 
+  private async writeMarkdown(): Promise<void> {
+    const path = join(this.header.configuration.workspace, "sessions", this.conversationId, "conversation.md");
+    try {
+      const literal = (text: string) => {
+        let fence = "```";
+        while (text.includes(fence)) fence += "`";
+        return fence + "text\n" + text + "\n" + fence;
+      };
+      const lines = ["# " + (this.header.label ?? "Conversation"), "",
+        "Conversation ID: " + this.conversationId, "",
+        "Saved messages: " + this.savedRecords.length, "",
+        "Updated automatically after saved checkpoints and on resume. Editing this file does not change model history.", ""];
+      if (this.header.origin) lines.push("From checkpoint: " + this.header.origin.checkpointId, "");
+      if (!this.savedRecords.length) lines.push("No messages saved yet. Your conversation will appear here after a completed task.", "");
+      this.savedRecords.forEach((record, index) => {
+        const message = (JSON.parse(record) as { message: Message }).message;
+        lines.push("## " + (index + 1) + ". " + message.role, "");
+        if (message.toolCallId !== undefined) lines.push(literal("Tool result ID: " + message.toolCallId), "");
+        lines.push(literal(message.content), "");
+        for (const call of message.toolCalls ?? []) {
+          lines.push("### Tool call", "", literal("Name: " + call.name + "\nID: " + call.id + "\nArguments:\n" + call.arguments), "");
+        }
+      });
+      await writeFile(path + ".tmp", lines.join("\n"), "utf8");
+      await rename(path + ".tmp", path);
+    } catch (error) {
+      await unlink(path + ".tmp").catch(() => {});
+      console.error("Could not update readable conversation:", path, error);
+    }
+  }
+
   static async inspect(workspace: string, conversationId: string, ordinal?: number) {
     validateId(conversationId);
     const parsed = parseHistory(await snapshot(join(await realpath(workspace), "sessions", conversationId, "history.jsonl")), conversationId);
-    const checkpoint = ordinal === undefined ? parsed.checkpoints.at(-1) : parsed.checkpoints[ordinal - 1];
-    if (ordinal !== undefined && (!Number.isInteger(ordinal) || ordinal < 1)) {
-      throw new Error("Checkpoint number must be a positive ordinal.");
+    const checkpoint = parsed.checkpoints.find((item) => item.ordinal === (ordinal ?? parsed.headOrdinal));
+    if (ordinal !== undefined && (!Number.isInteger(ordinal) || ordinal < (parsed.header.v === 2 ? 0 : 1))) {
+      throw new Error("Checkpoint number must be an available ordinal; #0 is the initial coding workspace.");
     }
     if (!checkpoint) throw new Error("Conversation has no saved completed task at that checkpoint.");
     return { header: parsed.header, checkpoints: parsed.checkpoints,
-      checkpoint, messages: parsed.messages.slice(0, checkpoint.messageCount) };
+      checkpoint, messages: checkpoint.messages ?? parsed.messages.slice(0, checkpoint.messageCount) };
   }
 
   static async list(workspace: string) {
@@ -224,7 +294,7 @@ export class ConversationStore {
     for (const conversationId of names.filter((name) => uuidPattern.test(name)).sort()) {
       try {
         const parsed = parseHistory(await snapshot(join(sessions, conversationId, "history.jsonl")), conversationId);
-        rows.push({ conversationId, header: parsed.header, checkpoints: parsed.checkpoints.length,
+        rows.push({ conversationId, header: parsed.header, checkpoints: parsed.checkpoints.filter((item) => item.ordinal > 0).length,
           ...(parsed.checkpoints.length ? {} : { unavailable: "no saved completed task" }) });
       } catch (error) {
         rows.push({ conversationId, checkpoints: 0, unavailable: error instanceof Error ? error.message : String(error) });
@@ -279,7 +349,12 @@ export class ConversationStore {
     let log: FileHandle | undefined;
     try {
       if (selection.mode !== "resume") {
-        const header: Header = { v: 1, kind: "header", conversationId,
+        const files = selected?.header.v === 1 ? undefined :
+          await WorkspaceHistory.create(current.workspace, conversationId, selected?.checkpoint.tree);
+        if (!files) await writeFile(join(directory, "AGENT_TEST.md"),
+          "# Agent test file\n\nStatus: not tested\nTest word: cobalt\n", { encoding: "utf8", flag: "wx" });
+        const header: Header = { v: files ? 2 : 1, kind: "header", conversationId,
+          ...(files ? { baseline: files.baseline } : {}),
           configuration: selected?.header.configuration ?? current,
           ...(selected ? { label, origin: { conversationId: selected.header.conversationId,
             checkpointId: selected.checkpoint.id,
@@ -292,24 +367,32 @@ export class ConversationStore {
         await syncDirectory(directory);
         await syncDirectory(sessions);
         await syncDirectory(current.workspace);
-        const store = new ConversationStore(header, headerBytes, log, lock, lockPath);
-        if (messages.length) await store.checkpoint(messages);
+        const store = new ConversationStore(header, headerBytes, log, lock, lockPath, files?.history);
+        if (messages.length) await store.saveCheckpoint(messages, files?.baseline);
+        else await store.writeMarkdown();
         return { store, messages, configuration: header.configuration,
           ...(selected ? { sourceCheckpoint: { ordinal: selected.checkpoint.ordinal, id: selected.checkpoint.id } } : {}) };
       }
       log = await open(join(directory, "history.jsonl"), constants.O_RDWR | constants.O_APPEND);
-      const bytes = await log.readFile();
-      const parsed = parseHistory(bytes, conversationId);
+      let bytes: Buffer = await log.readFile();
+      let parsed = parseHistory(bytes, conversationId);
       compatible(parsed.header.configuration, current);
       if (!parsed.savedEnd) throw new Error("Conversation has no saved completed task.");
+      const fileHistory = parsed.header.v === 2 ? await WorkspaceHistory.resume(current.workspace, conversationId) : undefined;
+      if (fileHistory) {
+        bytes = await ConversationStore.recoverRewind(fileHistory, log, bytes, conversationId, directory);
+        parsed = parseHistory(bytes, conversationId);
+      }
       // Only locked resume recovers tails. Inspection and branching never alter the source.
       if (parsed.savedEnd !== bytes.length) {
         await log.truncate(parsed.savedEnd);
         await log.sync();
       }
-      const store = new ConversationStore(parsed.header, parsed.headerBytes, log, lock, lockPath);
+      const store = new ConversationStore(parsed.header, parsed.headerBytes, log, lock, lockPath, fileHistory);
+      store.nextOrdinal = parsed.header.v === 2 ? parsed.checkpoints.length : 1;
       store.savedRecords = parsed.records;
       store.hash = parsed.savedHash;
+      await store.writeMarkdown();
       return { store, messages: parsed.messages, configuration: parsed.header.configuration };
     } catch (error) {
       try { await log?.close(); } finally {
@@ -321,7 +404,9 @@ export class ConversationStore {
 
   // Digest scope: exact UTF-8 header/message lines including LF; markers are excluded.
   // Marker IDs bind the conversation UUID and ordered message count.
-  async checkpoint(messages: Message[]): Promise<string> {
+  async checkpoint(messages: Message[]): Promise<string> { return this.saveCheckpoint(messages); }
+
+  private async saveCheckpoint(messages: Message[], capturedTree?: string): Promise<string> {
     if (!this.usable || this.closed) throw new Error("Conversation store is unavailable; stop this runner.");
     const records = messages.map(messageRecord);
     if (records.length <= this.savedRecords.length ||
@@ -331,9 +416,12 @@ export class ConversationStore {
     const newRecords = records.slice(this.savedRecords.length);
     const nextHash = this.hash.copy();
     for (const record of newRecords) nextHash.update(record);
-    const id = this.conversationId + ":" + messages.length;
+    const id = this.conversationId + ":" + (this.fileHistory ? this.nextOrdinal : messages.length);
+    const tree = capturedTree ?? await this.fileHistory?.capture("checkpoint");
+    const digest = nextHash.copy();
+    if (tree) digest.update("\0" + tree);
     const marker = JSON.stringify({ v: 1, kind: "checkpoint", id,
-      messageCount: messages.length, digest: nextHash.copy().digest("hex") }) + "\n";
+      messageCount: messages.length, digest: digest.digest("hex"), ...(tree ? { tree } : {}) }) + "\n";
     try {
       await this.log.writeFile(newRecords.join("") + marker);
       await this.log.sync();
@@ -343,7 +431,82 @@ export class ConversationStore {
     }
     this.hash = nextHash;
     this.savedRecords = records;
+    this.nextOrdinal++;
+    await this.writeMarkdown();
     return id;
+  }
+
+  // A rewind changes the active head, never deletes already saved checkpoints.
+  async rewind(ordinal: number): Promise<Message[]> {
+    if (!this.usable || this.closed || !this.fileHistory) throw new Error("In-place rewind requires an active coding conversation.");
+    const parsed = parseHistory(await snapshot(join(this.header.configuration.workspace, "sessions", this.conversationId, "history.jsonl")), this.conversationId);
+    const target = parsed.checkpoints.find((item) => item.ordinal === ordinal);
+    if (!target) throw new Error("No saved checkpoint #" + ordinal);
+    const directory = join(this.header.configuration.workspace, "sessions", this.conversationId);
+    const pending = join(directory, "rewind.pending.json");
+    let marker = "";
+    try {
+      await this.fileHistory.restore(target.tree!, async () => {
+        const recoveryTree = await this.fileHistory!.capture("before-rewind");
+        const operationId = randomUUID();
+        marker = rewindRecord(this.hash, target.id, recoveryTree, operationId);
+        const temporary = pending + ".tmp-" + operationId;
+        await writeFile(temporary, JSON.stringify({ v: 1, offset: parsed.savedEnd,
+          checkpointId: target.id, recoveryTree, operationId }), { flag: "wx", flush: true });
+        await link(temporary, pending); // Atomically publish complete bytes without overwriting a journal.
+        await unlink(temporary);
+        await syncDirectory(directory);
+      });
+      await this.log.writeFile(marker);
+      await this.log.sync();
+      this.hash.update(marker);
+      this.savedRecords = target.messages!.map(messageRecord);
+      await unlink(pending);
+      await syncDirectory(directory);
+      await this.writeMarkdown();
+      return target.messages!;
+    } catch (error) {
+      this.usable = false;
+      throw new Error("Rewind stopped. Resume this conversation to recover any pending restoration.", { cause: error });
+    }
+  }
+
+  private static async recoverRewind(files: WorkspaceHistory, log: FileHandle, bytes: Buffer,
+      conversationId: string, directory: string): Promise<Buffer> {
+    const pendingPath = join(directory, "rewind.pending.json");
+    let pending: unknown;
+    try { pending = JSON.parse((await snapshot(pendingPath)).toString()); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return bytes; throw error; }
+    if (!object(pending) || !fields(pending, ["v", "offset", "checkpointId", "recoveryTree", "operationId"]) ||
+        pending.v !== 1 || !Number.isSafeInteger(pending.offset) || Number(pending.offset) < 0 || Number(pending.offset) > bytes.length ||
+        typeof pending.checkpointId !== "string" || typeof pending.recoveryTree !== "string" || !/^[0-9a-f]{40}$/.test(pending.recoveryTree) ||
+        typeof pending.operationId !== "string" || !uuidPattern.test(pending.operationId)) throw new Error("Invalid pending rewind; files were not replaced.");
+    const offset = Number(pending.offset);
+    const prefix = bytes.subarray(0, offset);
+    const previous = parseHistory(prefix, conversationId);
+    if (previous.savedEnd !== offset || !previous.checkpoints.some((item) => item.id === pending.checkpointId)) {
+      throw new Error("Pending rewind does not match saved history; files were not replaced.");
+    }
+    const expected = Buffer.from(rewindRecord(previous.savedHash, pending.checkpointId, pending.recoveryTree, pending.operationId));
+    const tail = bytes.subarray(offset);
+    if (tail.equals(expected)) {
+      parseHistory(bytes, conversationId); // A validated marker was published only after restoration finished.
+      await log.sync();
+    } else {
+      if (tail.length >= expected.length || !tail.equals(expected.subarray(0, tail.length))) {
+        throw new Error("Unexpected history after pending rewind; files were not replaced.");
+      }
+      // Exceptional crash recovery preserves interrupted/manual changes before rolling back.
+      await files.capture("interrupted-rewind");
+      await files.restore(pending.recoveryTree);
+      await log.truncate(offset);
+      await log.sync();
+      bytes = prefix;
+      console.log("Interrupted rewind rolled back; interrupted files retained in file-snapshots.md.");
+    }
+    await unlink(pendingPath);
+    await syncDirectory(directory);
+    return bytes;
   }
 
   async close(): Promise<void> {

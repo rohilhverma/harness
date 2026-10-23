@@ -66,14 +66,14 @@ export function createReadFileTool(workspaceRoot: string): ToolDefinition {
         }
 
         const endLine = content.length ? start_line + content.length - 1 : null;
-        if (endLine !== null) {
+        if (endLine !== null || lines.length === 0) {
           const version = createHash("sha256").update(text).digest("hex");
           const previous = context.readRanges.get(file);
           context.readRanges.set(file, {
             version,
             ranges: [
               ...(previous?.version === version ? previous.ranges : []),
-              { start: start_line, end: endLine, turn: context.turn },
+              { start: start_line, end: endLine ?? 0, turn: context.turn },
             ],
           });
         }
