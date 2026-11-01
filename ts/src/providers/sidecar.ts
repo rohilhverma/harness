@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import type {
   ModelProvider, ModelRequest, ModelResponse, SidecarPending, SidecarReply,
 } from "../interfaces.js";
-import { parseQwen, renderQwen } from "./qwen.js";
+import { parseQwen, qwenGrammar, renderQwen, type PromptSegment } from "./qwen.js";
 
 // Matches n_ctx in c/src/model.cpp.
 export const CONTEXT_TOKENS = 16384;
@@ -84,7 +84,9 @@ export class SidecarProvider implements ModelProvider<ChildProcessWithoutNullStr
             clearTimeout(pending.timer);
             this.pending = undefined;
             const error = new Error(reply.error.code + ": " + reply.error.message);
-            error.name = "SidecarRequestError";
+            // Inference::prefill's capacity check; the sidecar stays usable, so callers may compact and retry.
+            error.name = reply.error.message === "Prompt and output allowance exceed context capacity." ?
+              "ContextOverflowError" : "SidecarRequestError";
             pending.reject(error);
           }
         } catch (error) {
@@ -142,7 +144,7 @@ export class SidecarProvider implements ModelProvider<ChildProcessWithoutNullStr
   prepare(request: Pick<ModelRequest, "messages" | "tools">): Promise<PreparationResult> {
     if (this.preparation) return Promise.reject(new Error("Preparation has already been started."));
     // The executor snapshots synchronously and captures rendering errors as rejections.
-    const rendered = new Promise<string>((resolvePrompt) => resolvePrompt(renderQwen(request)));
+    const rendered = new Promise<PromptSegment[]>((resolvePrompt) => resolvePrompt(renderQwen(request)));
     this.preparation = rendered.then(async (prompt) => {
       await this.createClient();
       const result = await this.send("prepare", { prompt });
@@ -168,6 +170,7 @@ export class SidecarProvider implements ModelProvider<ChildProcessWithoutNullStr
       temperature: request.temperature ?? 0.2,
       ...(request.seed === undefined ? {} : { seed: request.seed }),
       ...(request.sequence === undefined ? {} : { sequence: request.sequence }),
+      ...(request.tools?.length ? qwenGrammar(request.tools) : {}),
     });
     const { text, completion_reason, prompt_tokens, generated_tokens, evaluated_tokens } = result;
     if (typeof text !== "string" || (completion_reason !== "eog" && completion_reason !== "length") ||
@@ -176,16 +179,27 @@ export class SidecarProvider implements ModelProvider<ChildProcessWithoutNullStr
     }
     this.log(`[sidecar-provider] result prompt=${prompt_tokens} generated=${generated_tokens} evaluated=${evaluated_tokens} reason=${completion_reason}\n`);
     const usage = { promptTokens: Number(prompt_tokens), generatedTokens: Number(generated_tokens) };
+    // An unusable reply keeps its raw text, and `error` tells the model what to fix.
     if (completion_reason === "length") {
-      return { output: { role: "assistant", content: text }, conclusion: "length", usage };
+      // The parser rejects a reply cut off inside a call block.
+      try {
+        parseQwen(text, request.tools);
+        return { output: { role: "assistant", content: text }, conclusion: "length", usage };
+      } catch { /* Report the cut-off call below. */ }
+      this.log(`[sidecar-provider] output limit reached inside a tool call\n`);
+      return { output: { role: "assistant", content: text }, conclusion: "error", usage,
+        error: `Your reply reached the ${request.maxTokens ?? 2048}-token output limit inside a tool call, so no tool ran. ` +
+          "Split the work into smaller tool calls." };
     }
     try {
-      const output = parseQwen(text);
+      const output = parseQwen(text, request.tools);
       return { output, conclusion: output.toolCalls?.length ? "tool_request" : "success", usage };
     } catch (error) {
-      // The reply itself was valid, so end the turn as an error outcome and keep the raw text.
-      this.log(`[sidecar-provider] unparsable output: ${error instanceof Error ? error.message : String(error)}\n`);
-      return { output: { role: "assistant", content: text }, conclusion: "error", usage };
+      const reason = error instanceof Error ? error.message : String(error);
+      this.log(`[sidecar-provider] unparsable output: ${reason}\n`);
+      return { output: { role: "assistant", content: text }, conclusion: "error", usage,
+        error: `Your reply could not be parsed, so no tool ran. ${reason} ` +
+          "Send the tool call again as valid JSON inside <tool_call></tool_call>." };
     }
   }
 

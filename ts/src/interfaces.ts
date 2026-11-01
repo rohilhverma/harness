@@ -3,6 +3,17 @@ export interface AgentConfiguration {
   model: ModelConfiguration;
   tools: ToolDefinition[];
   memory: ConversationMemory;
+  compaction?: Compaction;
+  workspace?: string; // Absolute tool root, shown to the model in the notes block.
+  programs?: () => { process_id: string; command: string; state: string }[]; // exec programs, shown in the notes block.
+}
+
+// The prompt shows `summary`, then messages from `boundary` on. Tool outputs before
+// `messageCount` were shortened when this was made. The full history stays in memory.
+export interface Compaction {
+  summary: string;
+  boundary: number;
+  messageCount: number;
 }
 
 export interface AgentIdentity {
@@ -36,6 +47,7 @@ export interface ModelResponse {
   output: Message;
   conclusion: "success" | "error" | "length" | "tool_request";
   usage: { promptTokens: number; generatedTokens: number }; // Exact sidecar counts for this request.
+  error?: string; // With conclusion "error": why the reply ran nothing. Agent sends it back to the model.
 }
 
 // Remaining allowances for one outer user task, shared with its children.
@@ -54,6 +66,8 @@ export interface ToolExecutionContext {
     version: string;
     ranges: { start: number; end: number; turn: number }[];
   }>;
+  // Each file's check problems from before this request first changed it.
+  baselines: Map<string, string[]>;
 }
 
 export interface ToolDefinition {
@@ -70,6 +84,8 @@ export interface RunCommandResult {
   ok: boolean;
   status: "success" | "failed" | "timeout" | "rejected";
   exit_code: number | null;
+  full_output?: Partial<Record<"stdout" | "stderr", string>>;
+  note?: string;
   stdout: string;
   stderr: string;
   output_truncated: boolean;
@@ -82,6 +98,7 @@ export type ReadFileResult =
       path: string;
       start_line: number;
       end_line: number | null;
+      total_lines: number;
       content: string;
       next_line: number | null;
     }
@@ -94,6 +111,10 @@ export type ReadFileResult =
 export type SearchResult =
   | {
       ok: true;
+      full_results?: string;
+      total_matches?: number;
+      note?: string;
+      names?: string[];
       suggestions?: {
         term: string;
         path: string;
@@ -116,7 +137,8 @@ export type SearchResult =
     };
 
 export type EditFileResult =
-  | { ok: true; path: string }
+  | { ok: true; path: string; start_line?: number; end_line?: number; total_lines?: number; problems?: string[];
+      warnings?: string[]; content?: string }
   | { ok: false; path: string; error: string };
 
 export class ConversationMemory {

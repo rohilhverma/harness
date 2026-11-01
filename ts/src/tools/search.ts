@@ -1,8 +1,9 @@
 import { execFile } from "node:child_process";
 import { realpathSync } from "node:fs";
-import { realpath } from "node:fs/promises";
+import { readFile, realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { SearchResult, ToolDefinition } from "../interfaces.js";
+import { saveOutput } from "./outputs.js";
 
 const MAX_MATCHES = 15;
 const MAX_FILES = 6;
@@ -33,11 +34,13 @@ function withinOneEdit(left: string, right: string): boolean {
     );
 }
 
+// Literal patterns are alternatives: a line matching any of them matches.
 function runSearch(
   root: string,
   target: string,
-  pattern: string,
+  patterns: string[],
   suggest = false,
+  maxBytes = 16 * 1024,
 ): Promise<SearchResult> {
   return new Promise<SearchResult>((resolveResult) => {
     execFile(
@@ -55,7 +58,8 @@ function runSearch(
               // One extra match lets us detect the per-file limit.
               "--max-count", String(MAX_MATCHES_PER_FILE + 1),
             ]),
-        "--", suggest ? "[A-Za-z_][A-Za-z0-9_]*" : pattern, target,
+        ...(suggest ? ["-e", "[A-Za-z_][A-Za-z0-9_]*"] : patterns.flatMap((pattern) => ["-e", pattern])),
+        "--", target,
       ],
       {
         cwd: root,
@@ -106,7 +110,7 @@ function runSearch(
           if (suggest) {
             result.suggestions = [];
             const seen = new Set<string>();
-            const query = pattern.toLowerCase();
+            const query = patterns[0]!.toLowerCase();
 
             collect: for (const event of events) {
               if (event.type !== "match") continue;
@@ -141,7 +145,7 @@ function runSearch(
             });
             while (
               result.suggestions.length > 3 ||
-              Buffer.byteLength(JSON.stringify(result), "utf8") > 16 * 1024
+              Buffer.byteLength(JSON.stringify(result), "utf8") > maxBytes
             ) {
               result.suggestions.pop();
               result.limited = true;
@@ -198,7 +202,7 @@ function runSearch(
 
             if (
               Buffer.byteLength(JSON.stringify(result), "utf8") >
-              16 * 1024
+              maxBytes
             ) {
               file.matches.pop();
               if (file.matches.length === 0) result.files.pop();
@@ -224,7 +228,33 @@ function runSearch(
   });
 }
 
-export function createSearchTool(workspaceRoot: string): ToolDefinition {
+// Every matching line as path:line:text (up to 1 MiB), for results too long to return inline.
+function listMatches(root: string, target: string, patterns: string[]): Promise<string> {
+  return new Promise((resolveList) => {
+    execFile("rg", ["--no-config", "--ignore-case", "--fixed-strings", "--line-number", "--with-filename",
+      "--no-heading", "--sort", "path", ...patterns.flatMap((pattern) => ["-e", pattern]), "--", relative(root, target) || "."],
+    { cwd: root, encoding: "utf8", timeout: 10_000, killSignal: "SIGKILL", maxBuffer: 1024 * 1024 },
+    (error, stdout) => {
+      const lines = stdout.replace(/^\.\//gm, "");
+      resolveList(error && error.code !== 1 ? lines + "\n[listing stopped: " + error.message.slice(0, 200) + "]\n" : lines);
+    });
+  });
+}
+
+// Names declared in a file, in order: element ids, functions and variables. An empty search of the
+// file returns them, so a search for a description of the code is followed by one for a real name.
+async function declaredNames(file: string): Promise<string[]> {
+  const names = new Set<string>();
+  const declaration = /\bid\s*=\s*["']([^"']+)["']|\b(?:function|class|const|let|var)\s+([A-Za-z_$][\w$]*)|\bdef\s+([A-Za-z_]\w*)/g;
+  for (const match of (await readFile(file, "utf8")).matchAll(declaration)) {
+    names.add((match[1] ?? match[2] ?? match[3])!);
+    if (names.size >= 20) break;
+  }
+  return [...names];
+}
+
+// saveOutputs is off only for conversations saved before .harness/outputs, which keep their tool descriptions.
+export function createSearchTool(workspaceRoot: string, saveOutputs = false): ToolDefinition {
   const root = realpathSync(workspaceRoot);
 
   return {
@@ -233,10 +263,14 @@ export function createSearchTool(workspaceRoot: string): ToolDefinition {
       "Search for literal, case-insensitive text inside the workspace. " +
       "Returns up to 15 matching lines across 6 files, with at most 5 " +
       "matches per file and 3 surrounding lines on each side. " +
-      "Results are capped at 16 KiB; limited means results were restricted. " +
+      (saveOutputs ? "Results are capped at 8 KiB; limited means results were restricted, and then every " +
+        "matching line is saved to a file under .harness/outputs, named in full_results, for read_file. " :
+        "Results are capped at 16 KiB; limited means results were restricted. ") +
       "A complete empty search for a 4–64 character ASCII identifier also " +
       "checks up to 2,000 distinct tokens for one-edit spelling suggestions. " +
-      "Returns up to 3 suggestions with line excerpts; these are not literal matches.",
+      "Returns up to 3 suggestions with line excerpts; these are not literal matches. " +
+      "If text with | is not found, each |-separated part is searched. An empty search of one file also " +
+      "returns names: ids, functions and variables declared in it.",
     parameters: {
       type: "object",
       properties: {
@@ -264,12 +298,37 @@ export function createSearchTool(workspaceRoot: string): ToolDefinition {
           return { ok: false, error: "The search path is outside the workspace." };
         }
 
-        const result = await runSearch(root, target, pattern);
+        const maxBytes = saveOutputs ? 8 * 1024 : 16 * 1024;
+        let patterns = [pattern];
+        let result = await runSearch(root, target, patterns, false, maxBytes);
+        // Models join alternatives with | as in a regex; when that literal text is absent, each part is searched.
+        const parts = pattern.split("|").map((part) => part.trim()).filter(Boolean);
+        if (result.ok && result.files.length === 0 && !result.limited && parts.length > 1) {
+          patterns = parts;
+          result = await runSearch(root, target, patterns, false, maxBytes);
+        }
         if (
           result.ok && result.files.length === 0 && !result.limited &&
           /^[A-Za-z_][A-Za-z0-9_]{3,63}$/.test(pattern)
         ) {
-          return await runSearch(root, target, pattern, true);
+          result = await runSearch(root, target, patterns, true, maxBytes);
+        }
+        if (result.ok && result.files.length === 0 && (await stat(target)).isFile()) {
+          const names = await declaredNames(target);
+          if (names.length) {
+            return { ...result, names, note: "Nothing matched. names lists ids, functions and variables declared in " +
+              "this file; search for one of them, or read the file." };
+          }
+        }
+        if (saveOutputs && result.ok && result.limited) {
+          const listing = await listMatches(root, target, patterns);
+          const full_results = await saveOutput(root, "search", listing)
+            .catch((error: unknown) => "(not saved: " + (error instanceof Error ? error.message : String(error)) + ")");
+          // A live test answered from the shown matches only, so the count and a reminder are explicit.
+          // They come before the matches, so they survive when compaction cuts older tool results.
+          return { ok: true, full_results, total_matches: listing.split("\n").filter((line) => line && !line.startsWith("[listing stopped")).length,
+            note: "Only the first matches are shown. Read full_results with read_file to see every matching line.",
+            files: result.files, limited: true };
         }
         return result;
       } catch (error) {
