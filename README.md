@@ -1,49 +1,73 @@
-# Local agent harness
+# Local coding-agent harness
 
-A local coding-agent harness with a TypeScript workflow and a C++ llama.cpp
-inference sidecar. It supports saved conversations, workspace checkpoints,
-rewind/fork, file tools and optional sequential Reader/Writer subagents.
+A coding agent that runs entirely on a laptop. A TypeScript agent loop drives
+Qwen2.5-Coder-7B-Instruct model, through a C++ sidecar connected to llama.cpp. 
+
+The harness saves every conversation, pairs checkpoints of the agent's workspace
+with its messages, and can rewind or fork a conversation to any checkpoint. It's being iterated and evaluated, through a number of eval tests. Plan to test on SWE-bench eventually. 
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U[You, at the CLI] --> A[Agent loop<br/>ts/agent.ts]
+  A --> T[Tools<br/>files, search, exec, notes, delegate]
+  T --> A
+  A --> P[SidecarProvider + Qwen renderer<br/>ts/src/providers]
+  P -->|JSONL over stdin| S[C++ sidecar<br/>protocol, tokenize, prefill, sample]
+  S -->|JSONL over stdout| P
+  S --- L[llama.cpp<br/>pinned revision]
+  A --> H[History + checkpoints<br/>history.jsonl, snapshots.git]
+```
+
+- **Agent loop (TypeScript):** Renders the conversation, calls the model,
+  parses tool calls, runs tools and loops. It also catches repeated calls,
+  checks edits before applying them, and compacts older messages when the
+  prompt nears the 16K context.
+- **Sidecar (C++):** A long-lived process that loads the model once and answers
+  versioned JSONL requests. It reuses a evaluated prefix in RAM and evaluates tool outputs one at a time. 
+- **Tools:** Read, create, edit and delete files, search, run commands and
+  manage background programs; keep pinned notes; and delegate to Reader/Writer
+  subagents that share the loaded model. Handled thru TypeScript.
 
 ## What is saved
 
-This project uses saved history and inference recomputation, not persisted
-KV-cache checkpoints.
+The harness persists history, not KV-cache state, trading off speed for less memory consumption. 
 
 | State | Durable storage |
 | --- | --- |
-| Messages, assistant tool calls, tool results and configuration | `sessions/<id>/history.jsonl` |
-| Workspace file versions paired with checkpoints | Local `snapshots.git` object store |
-| Evaluated token IDs and computed KV state | RAM only; not saved in checkpoints |
+| Messages, tool calls and results, compaction summaries, configuration | `sessions/<id>/history.jsonl` Contains all the relevant history of the conversation|
+| Workspace file versions paired with checkpoints | Local `snapshots.git` object store. Used for rewinding/forking |
+| Full search and command output | `.harness/outputs` in the workspace. Relevant for logging.|
+| Evaluated tokens and KV state | RAM only, freed up upon shuttering down the model |
 
-Resume, rewind and conversation forks restore messages and settings, render the
-selected history, then tokenize/evaluate it again. Background preparation can do
-this while the user reads or types. We do not write a separate token-ID log or
-save/load native KV snapshots. This keeps durable storage small at the cost of
-recomputing model context.
+Resume, rewind and fork restore the messages and settings, and re-evaluate
+the rendered history. Background preparation can do this while you read or
+type, but can take some time. 
 
-llama.cpp still uses temporary KV state during inference, and the sidecar can
-reuse a matching evaluated prefix in RAM. That runtime optimization is separate
-from conversation persistence and file rewind.
+## Features
 
-## Current work
+- Saved conversations with `/checkpoints`, `/show`, `/rewind`, `/fork`,
+  `/switch` and `/delete`
+- A separate workspace per conversation, so forks get independent files
+- Context compaction, while keeping the full history on disk
+- Pinned notes (objective, changed files, last error, model-maintained plan). Relevant for keeping these smaller models on track, continue working towards objective.
+- Background programs with `/ps`, `/attach`, `/detach` and `/stop`
+- Sequential Reader/Writer subagents that return a compact report
 
-New coding conversations edit their own `sessions/<id>/workspace`. Rewind restores
-that same workspace; a fork gets independent files. Reader/Writer children share
-the parent's loaded model serially, use separate messages and return a compact
-report; they do not get saved KV states or create per-child checkpoints.
+## Start
 
-Delegation is installed for new conversations. A child-prompt clarification is
-still awaiting approval after a live Reader returned placeholder evidence without
-reading a file. Its temporary-copy Reader/Writer checks passed; this is not a
-quality benchmark. See [decisions](notes/decisions.md) for status and evidence.
 
-Read [the command reference](c/SIDECAR_COMMANDS.md) for launcher and in-harness commands
-and [the guide](c/SIDECAR_GUIDE.md) for setup, workspace selection, and debugging.
-
-After building the sidecar and installing TypeScript dependencies as described
-in the guide, run from the repository root:
+Start a conversation, or resume one, with:
 
 ```sh
-LLAMA_MODEL_PATH="/absolute/path/to/model.gguf" \
-node ts/src/dependencies/node_modules/tsx/dist/cli.mjs --tsconfig ts/tsconfig.json ts/main.ts
+./harness.sh
+./harness.sh --resume <conversation-id>
 ```
+
+`harness.sh` works in `~/harness-play` and starts the sidecar itself. Set
+`HARNESS_FOLDER`, `SIDECAR_EXECUTABLE` or `LLAMA_MODEL_PATH` to override the
+defaults (the model defaults to
+`~/models/qwen2.5-coder-7b/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf`).
+
+

@@ -1,10 +1,19 @@
-/Agent Harness with a C++ Session Sidecar Plan and Learning Guide.md
 .runtime/
 .env
 .DS_Store
 .vscode/
 build/
+build-release/
 *.log
 /sessions/
 /logs/
 /snapshots.git/
+
+# Generated eval output
+/evals/results/
+/evals/runs-auto/
+
+# Local agent instructions and notes, kept out of the public repo
+/ORCHESTRATOR.md
+/INTERVIEW_STORIES.md
+/notes/STORIES.md
